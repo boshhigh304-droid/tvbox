@@ -1,0 +1,107 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream repository, for example owner/repo. Leave empty to use repository variable UPSTREAM_REPO."
+        required: false
+        type: string
+      upstream_branch:
+        description: "Upstream branch. Leave empty to auto-detect, or use repository variable UPSTREAM_BRANCH."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync default branch from upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve upstream settings
+        id: settings
+        shell: bash
+        env:
+          INPUT_UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          INPUT_UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          VAR_UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          VAR_UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_REPO="${INPUT_UPSTREAM_REPO:-${VAR_UPSTREAM_REPO:-}}"
+          UPSTREAM_BRANCH="${INPUT_UPSTREAM_BRANCH:-${VAR_UPSTREAM_BRANCH:-}}"
+
+          if [ -z "$UPSTREAM_REPO" ]; then
+            echo "UPSTREAM_REPO is not set. Add repository variable UPSTREAM_REPO, or provide upstream_repo when running manually."
+            exit 1
+          fi
+
+          echo "repo=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Add and fetch upstream
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${{ steps.settings.outputs.repo }}.git"
+          git fetch upstream --prune
+
+          UPSTREAM_BRANCH="${{ steps.settings.outputs.branch }}"
+          if [ -z "$UPSTREAM_BRANCH" ]; then
+            UPSTREAM_BRANCH="$(git remote show upstream | sed -n '/HEAD branch/s/.*: //p')"
+          fi
+          if [ -z "$UPSTREAM_BRANCH" ]; then
+            if git show-ref --verify --quiet refs/remotes/upstream/master; then
+              UPSTREAM_BRANCH="master"
+            elif git show-ref --verify --quiet refs/remotes/upstream/main; then
+              UPSTREAM_BRANCH="main"
+            else
+              echo "Could not detect upstream default branch. Set UPSTREAM_BRANCH repository variable."
+              exit 1
+            fi
+          fi
+
+          echo "branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream into local default branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          UPSTREAM_BRANCH="${{ steps.upstream.outputs.branch }}"
+
+          git checkout "$DEFAULT_BRANCH"
+          git pull --ff-only origin "$DEFAULT_BRANCH"
+
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "Already up to date with upstream/$UPSTREAM_BRANCH."
+            exit 0
+          fi
+
+          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          git push origin "HEAD:$DEFAULT_BRANCH"
